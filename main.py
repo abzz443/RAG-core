@@ -154,7 +154,9 @@ def main():
     args = parser.parse_args()
 
     json_mode = getattr(args, "json", False)
-    if not json_mode:
+    if not json_mode and args.cmd != "chat":
+        print(BANNER)
+    elif args.cmd == "chat":
         print(BANNER)
 
     cfg = PipelineConfig()
