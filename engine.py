@@ -55,6 +55,22 @@ class PipelineConfig:
     persist_dir: str = "./store/chroma"
     collection_name: str = "ragcore_v1"
 
+    def __post_init__(self):
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({self.chunk_overlap}) must be "
+                f"less than chunk_size ({self.chunk_size})"
+            )
+        if self.top_k_rerank > self.top_k_retrieve:
+            raise ValueError(
+                f"top_k_rerank ({self.top_k_rerank}) cannot exceed "
+                f"top_k_retrieve ({self.top_k_retrieve})"
+            )
+        if not 0.0 <= self.min_confidence <= 1.0:
+            raise ValueError(
+                f"min_confidence ({self.min_confidence}) must be between 0 and 1"
+            )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Document loading
@@ -399,7 +415,10 @@ class RAGPipeline:
             self._store.reset()
 
         text, meta = DocumentLoader.load(filepath)
-        chunks = self._chunker.split(text, source=meta["filename"])
+        # Use absolute path as source to avoid chunk ID collisions
+        # between different files that share the same filename.
+        abs_source = str(Path(filepath).resolve())
+        chunks = self._chunker.split(text, source=abs_source)
         if not chunks:
             logger.warning("No usable chunks from '%s'", filepath)
             return 0
@@ -500,17 +519,42 @@ class RAGPipeline:
         t0 = time.perf_counter()
         text, meta = DocumentLoader.load(filepath)
 
-        # BART has a 1024-token input limit; use first ~3000 words
-        truncated = " ".join(text.split()[:3000])
-
         summariser = self._get_summariser()
-        out = summariser(
-            truncated,
-            max_length=220,
-            min_length=60,
-            do_sample=False,
-        )
-        summary = out[0]["summary_text"]
+        words = text.split()
+        # BART has a 1024-token input limit (~700 words).
+        # For long documents we summarise in 2500-word windows
+        # and then summarise the combined partial summaries.
+        WINDOW = 2500
+        if len(words) <= WINDOW:
+            windows = [text]
+        else:
+            windows = [
+                " ".join(words[i: i + WINDOW])
+                for i in range(0, len(words), WINDOW)
+            ]
+
+        partial_summaries: list[str] = []
+        for window in windows:
+            out = summariser(
+                window,
+                max_length=220,
+                min_length=40,
+                do_sample=False,
+            )
+            partial_summaries.append(out[0]["summary_text"])
+
+        if len(partial_summaries) == 1:
+            summary = partial_summaries[0]
+        else:
+            # Merge partial summaries into a final summary
+            merged = " ".join(partial_summaries)
+            out = summariser(
+                merged,
+                max_length=300,
+                min_length=60,
+                do_sample=False,
+            )
+            summary = out[0]["summary_text"]
         latency = round((time.perf_counter() - t0) * 1000, 1)
 
         logger.info(
